@@ -5,7 +5,7 @@
 
 from .adapters import DatasetWithEnumeratedTargets
 from .augmentations import DataAugmentationDINO
-from .collate import collate_data_and_cast
+from .collate import collate_data_and_cast, collate_h5_olmoearth_and_cast
 from .loaders import SamplerType, make_data_loader, make_dataset
 from .meta_loaders import CombinedDataLoader
 from .masking import MaskingGenerator

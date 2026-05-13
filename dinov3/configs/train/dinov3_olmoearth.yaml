@@ -1,5 +1,5 @@
 MODEL:
-  META_ARCHITECTURE: SSLMetaArch
+  META_ARCHITECTURE: DINOv3WithOLMoEarth
   DEVICE: cuda
   WEIGHTS: ''
   DTYPE: float32
@@ -62,13 +62,13 @@ gram:
   global_teacher_resize_antialias: false  # Whether to use antialiasing when resizing the outputs of the gram teacher
   loss_weight_schedule: null  # (dict): If not None, use a schedule for the loss weight instead of `loss_weight`
 train:
-  batch_size_per_gpu: 64
-  dataset_path: ImageNet:split=TRAIN
+  batch_size_per_gpu: 1
+  dataset_path: H5OlmoEarth:root=/home/guantp/pro/dinov3/dinov3/data/demo_dataset/dataset_index.json
   data_config: null
   output_dir: .
   saveckp_freq: 20
   seed: 0
-  num_workers: 10
+  num_workers: 8
   OFFICIAL_EPOCH_LENGTH: 1250
   monitor_gradient_norm: false
   chunk_schedule: []
@@ -82,7 +82,7 @@ train:
   sharded_eval_checkpoint: false
   cache_dataset: false
 student:
-  arch: vit_large
+  arch: vit_small
   patch_size: 16
   drop_path_rate: 0.3
   layerscale: 1.0e-05
@@ -98,7 +98,7 @@ student:
   mask_k_bias: false
   untie_cls_and_patch_norms: false  # If true, use separate norms for CLS/reg and patch/mask tokens
   untie_global_and_local_cls_norm: false  # If true, use separate norms for local and global crop CLS token during training
-  in_chans: 3
+  in_chans: 4
   pos_embed_type: rope
   pos_embed_rope_base: 100.0
   pos_embed_rope_min_period: null
@@ -116,7 +116,7 @@ teacher:
   warmup_teacher_temp: 0.04
   teacher_temp: 0.07
   warmup_teacher_temp_epochs: 30
-  in_chans: 3
+  in_chans: 4
 distillation:  # teacher
   enabled: false
   full_cfg_path: ""
@@ -153,13 +153,13 @@ crops:
   local_crops_scale:
   - 0.05
   - 0.32
-  global_crops_size: 224
-  local_crops_size: 96
+  global_crops_size: 480
+  local_crops_size: 200
   global_local_crop_pairs_ratios: 1.0
   gram_teacher_crops_size: null  # If not None, return crops for gram teacher
   localcrops_subset_of_globalcrops: false
   share_color_jitter: false
-  horizontal_flips: true
+  horizontal_flips: true # If true, apply horizontal flips
   gram_teacher_no_distortions: false  # If True, no distortions are applied to gram teacher crops
   rgb_mean:
   - 0.485
@@ -169,6 +169,9 @@ crops:
   - 0.229
   - 0.224
   - 0.225
+  n_channels: 4  # 3 for RGB, 4 for RGBNIR (must match student.in_chans and teacher.in_chans)
+  nir_mean: 0.5  # NIR normalization mean (used when n_channels=4)
+  nir_std: 0.25  # NIR normalization std (used when n_channels=4)
   teacher_to_student_resolution_scale: 1.0
 evaluation:
   eval_period_iterations: 12500
@@ -179,7 +182,20 @@ evaluation:
 checkpointing:
   period: 3750
   max_to_keep: 3
-  keep_every: 99999999999999999  # Save a checkpoint every N iterations, regardless of max_to_keep and period
+  keep_every: 500  # Save a checkpoint every N iterations, regardless of max_to_keep and period
+olmoearth:
+  enabled: true
+  model_id_or_path: "OlmoEarth-v1-Nano" # Hugging Face model ID or local path to the OlmoEarth model
+  max_sequence_length: 12               # Max temporal sequence length for H5 modalities
+  missing_value: -99999                  # Fill value for missing timesteps / modalities
+  patch_size: 2
+  spatial_align: 2                       # Spatial dims rounded to multiples of this for patchify
+  hr_h5_resolution_ratio: 40             # Integer: HR pixels per coarsest-H5 pixel (e.g. 16 means HR is 16x finer)
+  hr_crop_scale:                         # (min_scale, max_scale) for Level 1 random spatial crop
+  - 0.1
+  - 0.8
+  debug_crop_dims: false              # Log HR/H5 dimensions at each crop stage
+  return_hr_targets: false            # If true, dataset emits hr_target_images/masks/times for HR recon loss
 
 # Example of constant schedules with schedules v2
 # # schedules:

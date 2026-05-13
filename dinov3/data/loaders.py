@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Optional, TypeVar
 import torch
 from torch.utils.data import Sampler
 
-from .datasets import ADE20K, CocoCaptions, ImageNet, ImageNet22k, NYU
+from .datasets import ADE20K, CocoCaptions, H5OlmoEarthDataset, ImageNet, ImageNet22k, NYU
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
 
 logger = logging.getLogger("dinov3")
@@ -51,7 +51,7 @@ def _parse_dataset_str(dataset_str: str):
 
     for token in tokens[1:]:
         key, value = token.split("=")
-        assert key in ("root", "extra", "split")
+        assert key in ("root", "extra", "split", "hr_data_dir", "hr_meta_dir")
         kwargs[key] = value
 
     if name == "ImageNet":
@@ -72,6 +72,9 @@ def _parse_dataset_str(dataset_str: str):
         class_ = NYU
         if "split" in kwargs:
             kwargs["split"] = NYU.Split[kwargs["split"]]
+    elif name == "H5OlmoEarth":
+        class_ = H5OlmoEarthDataset
+        # H5OlmoEarth uses 'root' kwarg for the data directory
     else:
         raise ValueError(f'Unsupported dataset "{name}"')
 
@@ -84,6 +87,7 @@ def make_dataset(
     transform: Optional[Callable] = None,
     target_transform: Optional[Callable] = None,
     transforms: Optional[Callable] = None,
+    **extra_kwargs,
 ):
     """
     Creates a dataset with the specified parameters.
@@ -93,6 +97,8 @@ def make_dataset(
         transform: A transform to apply to images.
         target_transform: A transform to apply to targets.
         transforms: A transform to apply to both images and targets.
+        **extra_kwargs: Additional keyword arguments forwarded to the dataset
+                        constructor (e.g. spatial_align, missing_value).
 
     Returns:
         The created dataset.
@@ -100,6 +106,7 @@ def make_dataset(
     logger.info(f'using dataset: "{dataset_str}"')
 
     class_, kwargs = _parse_dataset_str(dataset_str)
+    kwargs.update(extra_kwargs)
     dataset = class_(transform=transform, target_transform=target_transform, transforms=transforms, **kwargs)
 
     logger.info(f"# of dataset samples: {len(dataset):,d}")

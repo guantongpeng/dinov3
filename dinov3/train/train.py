@@ -31,12 +31,14 @@ from dinov3.data import (
     MaskingGenerator,
     SamplerType,
     collate_data_and_cast,
+    collate_h5_olmoearth_and_cast,
     make_data_loader,
     make_dataset,
     CombinedDataLoader,
 )
 from dinov3.logging import MetricLogger, setup_logging
 from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosine_decay
+from dinov3.train.dino_with_olmoearth import DINOv3WithOLMoEarth
 from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
 from dinov3.train.ssl_meta_arch import SSLMetaArch
 
@@ -331,6 +333,103 @@ def build_data_loader_from_cfg(
     return data_loader
 
 
+def build_h5_olmoearth_data_loader_from_cfg(
+    cfg,
+    model,
+    start_iter,
+):
+    """Build a data loader for H5 OLMoEarth dataset (DINO V3 stage 2).
+
+    Uses collate_h5_olmoearth_and_cast which handles both DINO V3 crops
+    and OLMoEarth modalities in the same batch.
+
+    Dataset path in config must follow: H5OlmoEarth:root=<path_to_h5_dir>
+    """
+    # OLMoEarth config
+    olmoe = cfg.olmoearth
+    spatial_align = getattr(olmoe, "spatial_align", 4)
+    missing_value = getattr(olmoe, "missing_value", -99999)
+    max_sequence_length = getattr(olmoe, "max_sequence_length", 12)
+    debug_crop_dims = getattr(olmoe, "debug_crop_dims", False)
+    n_channels = cfg.crops.n_channels
+    hr_crop_scale = getattr(olmoe, "hr_crop_scale", None)
+    if hr_crop_scale is not None and not isinstance(hr_crop_scale, tuple):
+        hr_crop_scale = tuple(hr_crop_scale)
+    hr_h5_resolution_ratio = getattr(olmoe, "hr_h5_resolution_ratio", 16)
+    return_hr_targets = getattr(olmoe, "return_hr_targets", True)
+
+    # Collate function
+    img_size = cfg.crops.global_crops_size
+    patch_size = int(cfg.student.patch_size * cfg.crops.teacher_to_student_resolution_scale)
+    n_tokens = (img_size // patch_size) ** 2
+    mask_generator = MaskingGenerator(
+        input_size=(img_size // patch_size, img_size // patch_size),
+        max_num_patches=0.5 * img_size // patch_size * img_size // patch_size,
+    )
+
+    if cfg.multidistillation.enabled:
+        assert cfg.multidistillation.global_batch_size % distributed.get_subgroup_size() == 0
+        local_batch_size = cfg.multidistillation.global_batch_size // distributed.get_subgroup_size()
+        dataloader_batch_size_per_gpu = (
+            cfg.multidistillation.global_batch_size + (distributed.get_world_size() - 1)
+        ) // distributed.get_world_size()
+    else:
+        local_batch_size = None
+        dataloader_batch_size_per_gpu = cfg.train.batch_size_per_gpu
+
+    collate_fn = partial(
+        collate_h5_olmoearth_and_cast,
+        mask_ratio_tuple=cfg.ibot.mask_ratio_min_max,
+        mask_probability=cfg.ibot.mask_sample_probability,
+        dtype={
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[cfg.compute_precision.param_dtype],
+        n_tokens=n_tokens,
+        mask_generator=mask_generator,
+        random_circular_shift=cfg.ibot.mask_random_circular_shift,
+        local_batch_size=local_batch_size,
+        spatial_align=spatial_align,
+    )
+
+    batch_size = dataloader_batch_size_per_gpu
+    num_workers = cfg.train.num_workers
+    dataset_path = cfg.train.dataset_path
+
+    dataset = make_dataset(
+        dataset_str=dataset_path,
+        transform=model.build_data_augmentation_dino_h5(cfg),
+        target_transform=lambda _: (),
+        max_sequence_length=max_sequence_length,
+        spatial_align=spatial_align,
+        missing_value=missing_value,
+        debug_crop_dims=debug_crop_dims,
+        n_channels=n_channels,
+        hr_crop_scale=hr_crop_scale,
+        hr_h5_resolution_ratio=hr_h5_resolution_ratio,
+        return_hr_targets=return_hr_targets,
+    )
+
+    if isinstance(dataset, torch.utils.data.IterableDataset):
+        sampler_type = SamplerType.INFINITE
+    else:
+        sampler_type = SamplerType.SHARDED_INFINITE if cfg.train.cache_dataset else SamplerType.INFINITE
+
+    data_loader = make_data_loader(
+        dataset=dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=True,
+        seed=cfg.train.seed + start_iter + 1,
+        sampler_type=sampler_type,
+        sampler_advance=start_iter * dataloader_batch_size_per_gpu,
+        drop_last=True,
+        collate_fn=collate_fn,
+    )
+    return data_loader
+
+
 def build_multi_resolution_data_loader_from_cfg(
     cfg,
     model,
@@ -421,11 +520,19 @@ def do_train(cfg, model, resume=False):
         global_batch_size = cfg.train.batch_size_per_gpu * distributed.get_world_size()
 
     # Build data loader
-    data_loader = build_multi_resolution_data_loader_from_cfg(
-        cfg=cfg,
-        model=model,
-        start_iter=start_iter,
-    )
+    olmoearth_enabled = getattr(cfg, "olmoearth", None) is not None and cfg.olmoearth.get("enabled", False)
+    if olmoearth_enabled:
+        data_loader = build_h5_olmoearth_data_loader_from_cfg(
+            cfg=cfg,
+            model=model,
+            start_iter=start_iter,
+        )
+    else:
+        data_loader = build_multi_resolution_data_loader_from_cfg(
+            cfg=cfg,
+            model=model,
+            start_iter=start_iter,
+        )
 
     # Metric logging
     logger.info("Starting training from iteration %d", start_iter)
@@ -505,6 +612,7 @@ def do_train(cfg, model, resume=False):
             group=distributed.get_process_subgroup(),
         )
         total_loss = total_loss_all_ranks.mean()
+
         metrics_values = torch.stack(
             [torch.as_tensor(v, dtype=torch.float32, device=total_loss.device).detach() for v in metrics_dict.values()]
         )
@@ -514,6 +622,7 @@ def do_train(cfg, model, resume=False):
             group=distributed.get_process_subgroup(),
         )
         metrics_dict = dict(zip(metrics_dict.keys(), metrics_values))
+
         if total_loss_all_ranks.isnan().any():
             consecutive_nan_count += 1
             which_ranks = total_loss_all_ranks.isnan().nonzero().flatten().tolist()
@@ -595,7 +704,7 @@ def main(argv=None):
     else:
         setup_job(output_dir=args.output_dir, seed=args.seed)
         cfg = setup_config(args, strict_cfg=False)
-        logger.info(cfg)
+        logger.info(str(cfg))
         setup_logging(
             output=os.path.join(os.path.abspath(args.output_dir), "nan_logs"),
             name="nan_logger",
@@ -603,6 +712,7 @@ def main(argv=None):
     meta_arch = {
         "SSLMetaArch": SSLMetaArch,
         "MultiDistillationMetaArch": MultiDistillationMetaArch,
+        "DINOv3WithOLMoEarth": DINOv3WithOLMoEarth,
     }.get(cfg.MODEL.META_ARCHITECTURE, None)
     if meta_arch is None:
         raise ValueError(f"Unknown MODEL.META_ARCHITECTURE {cfg.MODEL.META_ARCHITECTURE}")
