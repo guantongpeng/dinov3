@@ -8,9 +8,9 @@ multi-modal embeddings that will be used for future fusion losses.
 import logging
 
 import torch
-from torch import nn
+from torch import nn, Tensor
 
-from dinov3.train.olmoearth_inference import load_olmoearth_model
+from dinov3.train.olmoearth_inference import load_olmoearth_model, run_olmoearth_inference
 from dinov3.train.ssl_meta_arch import SSLMetaArch
 
 logger = logging.getLogger("dinov3")
