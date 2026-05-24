@@ -1,12 +1,8 @@
 """DINO V3 with OLMoEarth integration for stage 2 training.
 
 Composes SSLMetaArch (DINO V3 self-supervised training) with a frozen
-OLMoEarth model (inference-only).
-
-Pipeline per training step:
-    1. SSLMetaArch.forward_backward runs the normal DINO/iBOT step (with its
-       own backward).
-    2. The frozen OLMoEarth encoder is loaded for evaluation / logging.
+OLMoEarth model (inference-only). The OLMoEarth encoder produces
+multi-modal embeddings that will be used for future fusion losses.
 """
 
 import logging
@@ -40,13 +36,17 @@ class DINOv3WithOLMoEarth(nn.Module):
         olmoe_cfg = cfg.olmoearth
         self.olmoearth_model_id_or_path = olmoe_cfg.model_id_or_path
         self.olmoearth_patch_size = olmoe_cfg.patch_size
-        self.olmoearth_missing_value = getattr(olmoe_cfg, "missing_value", -99999)
         self.olmoearth_model = None  # Loaded in init_weights after FSDP setup
 
-        logger.info(
-            f"OLMoEarth integration enabled: model={self.olmoearth_model_id_or_path}, "
-            f"patch_size={self.olmoearth_patch_size}"
-        )
+        logger.info(f"OLMoEarth integration enabled: model={self.olmoearth_model_id_or_path}, "
+                     f"patch_size={self.olmoearth_patch_size}")
+
+    def _apply(self, fn, recurse=True):
+        # Only apply to dino_model; olmoearth_model is loaded separately
+        self.dino_model._apply(fn, recurse)
+        if self.olmoearth_model is not None:
+            self.olmoearth_model._apply(fn)
+        return self
 
     def init_weights(self):
         self.dino_model.init_weights()
@@ -64,18 +64,41 @@ class DINOv3WithOLMoEarth(nn.Module):
 
     def forward_backward(
         self, data, *, teacher_temp, iteration=0, **kwargs
-    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
-        # Pop OLMoEarth + HR-target fields that SSLMetaArch does not expect
-        data.pop("olmoearth_modalities", None)
-        data.pop("olmoearth_metadata", None)
+    ) -> tuple[Tensor, dict[str, float | Tensor]]:
+        metrics_dict = {}
+
+        # Extract OLMoEarth data (list of dicts, one per global crop)
+        olmoearth_modalities_list = data.pop("olmoearth_modalities", None)
+        olmoearth_metadata_list = data.pop("olmoearth_metadata", None)
+
+        # Extract HR target data that SSLMetaArch does not expect
         data.pop("hr_target_images", None)
         data.pop("hr_target_masks", None)
         data.pop("hr_target_start_times", None)
         data.pop("hr_data_start_time", None)
 
-        return self.dino_model.forward_backward(
+        # Standard DINO V3 forward-backward
+        # data now has collated_global_crops, collated_local_crops, collated_masks, etc.
+        total_loss, dino_metrics = self.dino_model.forward_backward(
             data, teacher_temp=teacher_temp, iteration=iteration
         )
+        metrics_dict.update(dino_metrics)
+
+        # OLMoEarth inference (frozen, no grad) per global crop
+        if olmoearth_modalities_list is not None and self.olmoearth_model is not None:
+            for crop_idx, (modalities, metadata) in enumerate(
+                zip(olmoearth_modalities_list, olmoearth_metadata_list)
+            ):
+                olmoearth_embeddings = run_olmoearth_inference(
+                    self.olmoearth_model,
+                    modalities,
+                    metadata,
+                    patch_size=self.olmoearth_patch_size,
+                )
+
+                del olmoearth_embeddings
+
+        return total_loss, metrics_dict
 
     # --- Delegated methods ---
 

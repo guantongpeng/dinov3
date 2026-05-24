@@ -15,5 +15,4 @@ dist/
 *.swp
 
 # Ignore vscode directory
-.vscode/
 local_dino

@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "DINOv3 Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "dinov3.train.train",
+            "args": [
+                "--config-file",
+                "/home/guantp/pro/dinov3/dinov3/configs/train/dinov3_olmoearth.yaml"
+            ],
+            "cwd": "/home/guantp/pro/dinov3",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "/home/guantp/pro/dinov3"
+            }
+        }
+    ]
+}
