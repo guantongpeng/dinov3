@@ -13,7 +13,7 @@ from olmoearth_pretrain.datatypes import MaskedOlmoEarthSample, MaskValue
 
 logger = logging.getLogger("dinov3")
 
-_DEFAULT_MISSING_VALUE = -99999
+MISSING_VALUE = -99999
 
 
 def load_olmoearth_model(
@@ -51,8 +51,7 @@ def run_olmoearth_inference(
     olmoearth_metadata: dict[str, torch.Tensor],
     patch_size: int = 4,
     device: torch.device = torch.device("cuda"),
-    missing_value: float = _DEFAULT_MISSING_VALUE,
-) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+) -> dict[str, torch.Tensor]:
     """Run OLMoEarth encoder inference on batched modality data.
 
     Constructs a MaskedOlmoEarthSample from the batch tensors, runs the
@@ -64,22 +63,14 @@ def run_olmoearth_inference(
         olmoearth_metadata: Dict with 'timestamps' [B, T, 3] and 'latlon' [B, 2].
         patch_size: Patch size for the OLMoEarth encoder.
         device: Compute device.
-        missing_value: Fill value used for missing modalities/timesteps.
 
     Returns:
-        Tuple ``(embeddings, valid_masks)``:
-            - ``embeddings``: dict mapping modality name to embedding tensor,
-              e.g. {"sentinel2_l2a": [B, P_H, P_W, T, Band_Sets, D], ...}
-            - ``valid_masks``: dict mapping modality name to a 1-D boolean
-              tensor of shape ``(B,)``. ``True`` means the sample has any
-              non-missing data for that modality (i.e. its input was NOT
-              entirely ``missing_value``). Used downstream by losses that
-              need to skip per-sample modality terms with no ground truth.
+        Dict mapping modality name to embedding tensor,
+        e.g. {"sentinel2_l2a": [B, P_H, P_W, T, Band_Sets, D], ...}
     """
 
     batch_dict = {}
     mask_dict = {}
-    per_sample_valid: dict[str, torch.Tensor] = {}
 
     # Timestamps (required by MaskedOlmoEarthSample)
     timestamps = olmoearth_metadata["timestamps"].to(device=device, dtype=torch.long)
@@ -103,15 +94,14 @@ def run_olmoearth_inference(
         mask_shape = list(mod_data.shape)
         mask_shape[-1] = mod_spec.num_band_sets
 
-        # Check per-batch-item: if entirely missing_value, mark as MISSING
+        # Check per-batch-item: if entirely MISSING_VALUE, mark as MISSING
         mask = torch.full(
             mask_shape, MaskValue.ONLINE_ENCODER.value, dtype=torch.float32, device=device
         )
 
         # Reshape to [B, -1] for efficient per-sample check
         flat = mod_data.reshape(mod_data.shape[0], -1)
-        is_missing = (flat == missing_value).all(dim=-1)  # [B]
-        per_sample_valid[modality_name] = ~is_missing
+        is_missing = (flat == MISSING_VALUE).all(dim=-1)  # [B]
 
         if is_missing.any():
             # Expand [B] -> [B, 1, 1, 1, 1] to broadcast over mask shape
@@ -137,4 +127,4 @@ def run_olmoearth_inference(
         if features is not None:
             embeddings[modality] = features
 
-    return embeddings, per_sample_valid
+    return embeddings
