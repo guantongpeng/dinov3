@@ -184,6 +184,23 @@ class FasterRCNNConfig:
 
 
 @dataclass(kw_only=True)
+class OrientedRCNNConfig:
+    """Oriented R-CNN specific config for rotated object detection."""
+
+    rpn: RPNConfig = field(default_factory=RPNConfig)
+    roi_head: RoIHeadConfig = field(default_factory=RoIHeadConfig)
+
+    # Feature pyramid
+    num_feature_levels: int = 5  # P2-P6
+    feature_hidden_dim: int = 256
+    use_fpn: bool = True
+
+    # Rotation-specific
+    num_angles: int = 180  # number of angle bins (for angle prediction granularity)
+    angle_version: str = "le90"  # angle representation: le90 ([-90, 90)), le135 ([-135, 45)), oc ([0, 180))
+
+
+@dataclass(kw_only=True)
 class DetectionTrainConfig:
     """Full config for detection training, combining head config + training params."""
 
@@ -192,11 +209,12 @@ class DetectionTrainConfig:
     pretrained_weights: str | None = None  # path to backbone weights
     load_from: str | None = None  # path to detection checkpoint to resume from
 
-    # Detector type: "detr" or "faster_rcnn"
+    # Detector type: "detr", "faster_rcnn", or "oriented_rcnn"
     detector_type: str = "detr"
 
     head: DetectionHeadConfig = field(default_factory=DetectionHeadConfig)
     faster_rcnn: FasterRCNNConfig = field(default_factory=FasterRCNNConfig)
+    oriented_rcnn: OrientedRCNNConfig = field(default_factory=OrientedRCNNConfig)
     matcher: MatcherConfig = field(default_factory=MatcherConfig)
     loss: LossConfig = field(default_factory=LossConfig)
 

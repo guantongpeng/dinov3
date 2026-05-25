@@ -75,17 +75,22 @@ class RandomHorizontalFlip:
     def __call__(self, img, target):
         if random.random() < self.p:
             img = T.functional.hflip(img)
+            w = img.size[0]
             if target is not None and "boxes" in target and len(target["boxes"]) > 0:
-                w = img.size[0]
                 boxes = target["boxes"].clone()
                 boxes[:, 0] = w - boxes[:, 0]
                 boxes[:, 2] = w - boxes[:, 2]
-                # Swap x1, x2 since they may have flipped order
                 x1 = boxes[:, 0].min(boxes[:, 2])
                 x2 = boxes[:, 0].max(boxes[:, 2])
                 boxes[:, 0] = x1
                 boxes[:, 2] = x2
                 target["boxes"] = boxes
+            if target is not None and "boxes_obb" in target and len(target["boxes_obb"]) > 0:
+                # Flip oriented boxes: cx becomes w - cx, theta becomes -theta
+                boxes_obb = target["boxes_obb"].clone()
+                boxes_obb[:, 0] = w - boxes_obb[:, 0]
+                boxes_obb[:, 4] = -boxes_obb[:, 4]
+                target["boxes_obb"] = boxes_obb
         return img, target
 
 
@@ -111,6 +116,14 @@ class Normalize:
             boxes[:, 2] /= w
             boxes[:, 3] /= h
             target["boxes"] = box_xyxy_to_cxcywh(boxes)
+        if target is not None and "boxes_obb" in target and len(target["boxes_obb"]) > 0:
+            # Normalize oriented boxes: cx, w by width; cy, h by height; theta stays in radians
+            boxes_obb = target["boxes_obb"].clone()
+            boxes_obb[:, 0] /= w
+            boxes_obb[:, 1] /= h
+            boxes_obb[:, 2] /= w
+            boxes_obb[:, 3] /= h
+            target["boxes_obb"] = boxes_obb
         if target is not None:
             target["size"] = torch.tensor([h, w])
         return img, target
@@ -295,6 +308,125 @@ class CustomDetectionDataset(torch.utils.data.Dataset):
             img, target = self.transforms(img, target)
 
         return img, target
+
+
+class DOTADetection(torch.utils.data.Dataset):
+    """DOTA-format rotated detection dataset.
+
+    DOTA stores oriented bounding boxes as 8-point polygons:
+    [x1, y1, x2, y2, x3, y3, x4, y4].
+
+    We convert them to 5-param representation (cx, cy, w, h, theta) in radians,
+    using the long-edge definition (le90): theta is the angle of the longer edge,
+    in [-pi/2, pi/2).
+    """
+
+    def __init__(self, img_dir, ann_file, transforms=None):
+        self.img_dir = img_dir
+        self.transforms = transforms
+
+        with open(ann_file) as f:
+            data = json.load(f)
+
+        self.images = {img["id"]: img for img in data["images"]}
+        self.categories = {cat["id"]: cat for cat in data.get("categories", [])}
+        cat_ids = sorted(self.categories.keys())
+        self.cat_id_to_idx = {cat_id: idx for idx, cat_id in enumerate(cat_ids)}
+
+        # Group annotations by image_id
+        self.img_to_anns = {}
+        for ann in data.get("annotations", []):
+            img_id = ann["image_id"]
+            if img_id not in self.img_to_anns:
+                self.img_to_anns[img_id] = []
+            self.img_to_anns[img_id].append(ann)
+
+        self.ids = list(sorted(self.images.keys()))
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        img_id = self.ids[idx]
+        img_info = self.images[img_id]
+        img_path = os.path.join(self.img_dir, img_info["file_name"])
+        img = torchvision.io.read_image(img_path)
+        img = T.functional.to_pil_image(img)
+
+        h, w = img_info["height"], img_info["width"]
+        anns = self.img_to_anns.get(img_id, [])
+
+        boxes, boxes_obb, labels = [], [], []
+        for ann in anns:
+            if ann.get("iscrowd", 0):
+                continue
+
+            # DOTA format: 8-point polygon (quadrilateral)
+            if "bbox_obb" in ann:
+                # Pre-computed oriented bbox: [cx, cy, w, h, theta]
+                obb = ann["bbox_obb"]
+                boxes.append([obb[0] - obb[2] / 2, obb[1] - obb[3] / 2,
+                              obb[0] + obb[2] / 2, obb[1] + obb[3] / 2])
+                boxes_obb.append(obb)
+            elif "segmentation" in ann and len(ann["segmentation"]) > 0:
+                # 8-point polygon -> convert to oriented bbox
+                poly = ann["segmentation"][0] if isinstance(ann["segmentation"], list) else ann["segmentation"]
+                obb = _polygon_to_obb(torch.tensor(poly, dtype=torch.float32).view(-1, 2))
+                boxes.append([obb[0] - obb[2] / 2, obb[1] - obb[3] / 2,
+                              obb[0] + obb[2] / 2, obb[1] + obb[3] / 2])
+                boxes_obb.append(obb.tolist())
+            elif "bbox" in ann:
+                # Fallback: use axis-aligned bbox and convert to pseudo-oriented (theta=0)
+                x, y, bw, bh = ann["bbox"]
+                if bw <= 0 or bh <= 0:
+                    continue
+                boxes.append([x, y, x + bw, y + bh])
+                boxes_obb.append([x + bw / 2, y + bh / 2, bw, bh, 0.0])
+            else:
+                continue
+
+            labels.append(self.cat_id_to_idx.get(ann["category_id"], 0))
+
+        target = {
+            "image_id": img_id,
+            "orig_size": torch.as_tensor([h, w]),
+        }
+        if len(boxes) > 0:
+            target["boxes"] = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+            target["boxes_obb"] = torch.as_tensor(boxes_obb, dtype=torch.float32).reshape(-1, 5)
+            target["labels"] = torch.as_tensor(labels, dtype=torch.int64)
+        else:
+            target["boxes"] = torch.zeros((0, 4), dtype=torch.float32)
+            target["boxes_obb"] = torch.zeros((0, 5), dtype=torch.float32)
+            target["labels"] = torch.zeros((0,), dtype=torch.int64)
+
+        if self.transforms is not None:
+            img, target = self.transforms(img, target)
+
+        return img, target
+
+
+def _polygon_to_obb(poly: torch.Tensor) -> torch.Tensor:
+    """Convert 4-point polygon [4, 2] to oriented bbox (cx, cy, w, h, theta).
+
+    Uses the long-edge definition (le90): theta in [-pi/2, pi/2).
+    """
+    cx = poly[:, 0].mean()
+    cy = poly[:, 1].mean()
+
+    v1 = poly[1] - poly[0]
+    v2 = poly[2] - poly[1]
+    len1 = torch.norm(v1)
+    len2 = torch.norm(v2)
+
+    if len1 >= len2:
+        w, h = len1, len2
+        theta = torch.atan2(v1[1], v1[0])
+    else:
+        w, h = len2, len1
+        theta = torch.atan2(v2[1], v2[0])
+
+    return torch.stack([cx, cy, w, h, theta])
 
 
 def build_dataloader(dataset, batch_size, num_workers, distributed=True, drop_last=True):

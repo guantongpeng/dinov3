@@ -90,6 +90,23 @@ def build_detection_model(config: DetectionTrainConfig):
 
         return detector, config.head
 
+    if detector_type == "oriented_rcnn":
+        # Build Oriented R-CNN
+        from dinov3.eval.detection.models.oriented_rcnn import build_oriented_rcnn
+
+        config.head.layers_to_use = (
+            config.head.layers_to_use
+            if config.head.layers_to_use is not None
+            else [m * backbone.n_blocks // 4 - 1 for m in range(1, 5)]
+        )
+        detector = build_oriented_rcnn(backbone, config)
+
+        if not config.train_backbone:
+            for name, param in detector.backbone.named_parameters():
+                param.requires_grad = False
+
+        return detector, config.head
+
     # Default: DETR
     # Configure head
     head_config = config.head
@@ -243,7 +260,7 @@ def train_one_epoch(
         with torch.autocast(
             "cuda", dtype=model_dtype, enabled=(model_dtype is not None)
         ):
-            if detector_type == "faster_rcnn":
+            if detector_type in ("faster_rcnn", "oriented_rcnn"):
                 loss_dict = detector(samples, targets)
                 loss = sum(loss_dict.values())
             else:
@@ -300,7 +317,7 @@ def evaluate(detector, criterion, dataloader, postprocessor, device, detector_ty
         samples: NestedTensor = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        if detector_type == "faster_rcnn":
+        if detector_type in ("faster_rcnn", "oriented_rcnn"):
             outputs = detector(samples, targets)
             loss_dict = outputs["losses"]
             loss = sum(loss_dict.values())
@@ -312,42 +329,63 @@ def evaluate(detector, criterion, dataloader, postprocessor, device, detector_ty
         loss_stats.append(loss.item())
 
         # Post-process predictions
-        if detector_type == "faster_rcnn":
+        if detector_type in ("faster_rcnn", "oriented_rcnn"):
             orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+            is_oriented = (detector_type == "oriented_rcnn")
             for i, target in enumerate(targets):
                 image_id = target.get("image_id", 0)
                 if isinstance(image_id, torch.Tensor):
                     image_id = image_id.item()
                 scores = outputs["pred_logits"][i]
-                boxes = outputs["pred_boxes"][i]  # cxcywh normalized
+                boxes = outputs["pred_boxes"][i]  # cxcywh normalized (4-param) or cxcywht normalized (5-param)
 
                 if scores.numel() == 0:
                     continue
 
-                # Get non-zero predictions
                 max_scores, labels = scores.max(dim=1)
                 keep = max_scores > 0
                 if not keep.any():
                     continue
 
-                boxes_kept = box_cxcywh_to_xyxy(boxes[keep])
+                boxes_kept = boxes[keep]
                 orig_h, orig_w = orig_target_sizes[i].tolist()
-                boxes_kept[:, 0] *= orig_w
-                boxes_kept[:, 1] *= orig_h
-                boxes_kept[:, 2] *= orig_w
-                boxes_kept[:, 3] *= orig_h
-                boxes_kept[:, 0].clamp_(min=0, max=orig_w)
-                boxes_kept[:, 1].clamp_(min=0, max=orig_h)
-                boxes_kept[:, 2].clamp_(min=0, max=orig_w)
-                boxes_kept[:, 3].clamp_(min=0, max=orig_h)
 
-                for score, label, box in zip(max_scores[keep], labels[keep], boxes_kept):
-                    x1, y1, x2, y2 = box.tolist()
+                if is_oriented:
+                    # Convert oriented (cx, cy, w, h, theta) to axis-aligned (x1, y1, x2, y2)
+                    # by using the circumscribed axis-aligned box of the rotated box
+                    from dinov3.eval.detection.models.oriented_rcnn import obb_xywht_to_xyxy
+                    obb_pixel = boxes_kept.clone()
+                    obb_pixel[:, 0] *= orig_w
+                    obb_pixel[:, 1] *= orig_h
+                    obb_pixel[:, 2] *= orig_w
+                    obb_pixel[:, 3] *= orig_h
+                    corners = obb_xywht_to_xyxy(obb_pixel)  # [N, 8]
+                    x1 = corners[:, 0::2].min(dim=1).values
+                    y1 = corners[:, 1::2].min(dim=1).values
+                    x2 = corners[:, 0::2].max(dim=1).values
+                    y2 = corners[:, 1::2].max(dim=1).values
+                    x1.clamp_(min=0, max=orig_w)
+                    y1.clamp_(min=0, max=orig_h)
+                    x2.clamp_(min=0, max=orig_w)
+                    y2.clamp_(min=0, max=orig_h)
+                else:
+                    boxes_kept = box_cxcywh_to_xyxy(boxes_kept)
+                    boxes_kept[:, 0] *= orig_w
+                    boxes_kept[:, 1] *= orig_h
+                    boxes_kept[:, 2] *= orig_w
+                    boxes_kept[:, 3] *= orig_h
+                    boxes_kept[:, 0].clamp_(min=0, max=orig_w)
+                    boxes_kept[:, 1].clamp_(min=0, max=orig_h)
+                    boxes_kept[:, 2].clamp_(min=0, max=orig_w)
+                    boxes_kept[:, 3].clamp_(min=0, max=orig_h)
+                    x1, y1, x2, y2 = boxes_kept[:, 0], boxes_kept[:, 1], boxes_kept[:, 2], boxes_kept[:, 3]
+
+                for score, label, x1v, y1v, x2v, y2v in zip(max_scores[keep], labels[keep], x1, y1, x2, y2):
                     all_results.append(
                         {
                             "image_id": image_id,
                             "category_id": label.item(),
-                            "bbox": [x1, y1, x2 - x1, y2 - y1],
+                            "bbox": [x1v.item(), y1v.item(), (x2v - x1v).item(), (y2v - y1v).item()],
                             "score": score.item(),
                         }
                     )
@@ -414,7 +452,7 @@ def train_detection(config: DetectionTrainConfig):
     else:
         detector_without_ddp = detector
 
-    # 3. Build criterion (only for DETR, Faster R-CNN has built-in loss)
+    # 3. Build criterion (only for DETR; Faster R-CNN and Oriented R-CNN have built-in loss)
     criterion = None
     if detector_type == "detr":
         criterion, weight_dict = build_criterion(config)
@@ -491,7 +529,7 @@ def train_detection(config: DetectionTrainConfig):
         if "best_val_loss" in checkpoint:
             best_val_loss = checkpoint["best_val_loss"]
 
-    # 6. Post-processor for evaluation (DETR only)
+    # 6. Post-processor for evaluation (DETR only; Faster R-CNN / Oriented R-CNN have built-in postprocessing)
     postprocessor = PostProcess(topk=head_config.topk, reparam=head_config.reparam) if detector_type == "detr" else None
 
     # 7. Training loop
