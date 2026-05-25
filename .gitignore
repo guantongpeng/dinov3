@@ -17,3 +17,7 @@ dist/
 # Ignore vscode directory
 local_dino
 .claude
+.vscode
+.understand-anything
+.cursor
+.codegraph
