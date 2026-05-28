@@ -26,6 +26,17 @@ golffield, groundtrackfield, harbor, overpass, ship,
 stadium, storagetank, tenniscourt, trainstation, vehicle, windmill
 ```
 
+### 数据集划分
+
+数据集使用 `ImageSets/Main` 下的官方划分文件：
+
+| 划分 | 文件 | 图像数 | 标注数 |
+|---|---|---|---|
+| train | `train.txt` | 5,862 | 32,591 |
+| val | `val.txt` | 5,863 | 35,434 |
+| test | `test.txt` | 11,738 | 124,440 |
+| **总计** | | **23,463** | **192,465** |
+
 ### 数据集准备
 
 ```bash
@@ -38,8 +49,9 @@ unzip JPEGImages-test.zip -d DIOR/
 mv DIOR/JPEGImages-test/*.jpg DIOR/JPEGImages/
 unzip ImageSets.zip -d DIOR/
 
-# 2. VOC XML → COCO JSON 转换
-python data/DIOR/convert_dior_to_coco.py
+# 2. VOC XML → COCO JSON 转换（使用 ImageSets/Main 中的官方 train/val/test 划分）
+cd ../..  # 回到项目根目录
+python scripts/convert_dior_to_coco.py
 
 # 3. 创建数据符号链接
 cd data/DIOR
@@ -69,19 +81,14 @@ ln -sf DIOR/JPEGImages val2019
 | 梯度裁剪 | max_norm=1.0 |
 | 评估间隔 | 每 3 个 epoch |
 
-### 关键配置修正
+### 关键配置说明
 
-由于 DIOR 数据集仅有 20 个类别（不同于 COCO 的 80 类），需要在配置中显式设置 `metainfo`：
+DIOR 数据集仅有 20 个类别（不同于 COCO 的 80 类），配置通过 `_base_` 继承 `dinov3_faster_rcnn_base.py` 的模型结构（Faster R-CNN + FPN + RPN + RoI Head），并做以下覆写：
 
-```python
-dior_classes = (
-    "airplane", "airport", "baseballfield", "basketballcourt", "bridge",
-    "chimney", "dam", "Expressway-Service-area", "Expressway-toll-station",
-    "golffield", "groundtrackfield", "harbor", "overpass", "ship",
-    "stadium", "storagetank", "tenniscourt", "trainstation", "vehicle", "windmill",
-)
-metainfo = dict(classes=dior_classes)
-```
+- **类别数**: `num_classes = 20`，通过 `roi_head.bbox_head.num_classes` 覆写
+- **类别名**: 通过 `metainfo` 显式设置 20 个 DIOR 类别
+- **骨干网络**: DINOv3 ViT-B/16，`frozen_stages=-1` 冻结，使用自定义预训练权重
+- **数据划分**: 严格使用 `ImageSets/Main` 中的 `train.txt`/`val.txt` 划分
 
 ## 训练命令
 
@@ -122,7 +129,7 @@ python -m dinov3.eval.detection.mm_train \
 | `data/DIOR/DIOR/Annotations/` | VOC XML 标注 (23,463 个文件) |
 | `data/DIOR/DIOR/JPEGImages/` | 图像文件 (23,463 张) |
 | `data/DIOR/DIOR/ImageSets/Main/` | train/val/test 划分 |
-| `data/DIOR/annotations/` | COCO JSON 标注 |
-| `data/DIOR/convert_dior_to_coco.py` | VOC→COCO 格式转换脚本 |
+| `data/DIOR/annotations/` | COCO JSON 标注（由 `scripts/convert_dior_to_coco.py` 生成） |
+| `scripts/convert_dior_to_coco.py` | VOC→COCO 格式转换脚本（按 ImageSets/Main 划分） |
 | `dinov3/eval/detection/configs/faster_rcnn/faster_rcnn_dinov3_vitb16_dior.py` | 训练配置 |
 | `work_dirs/faster_rcnn_dinov3_vitb16_dior/` | 训练输出（checkpoint、日志） |

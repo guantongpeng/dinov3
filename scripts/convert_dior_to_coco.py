@@ -88,10 +88,10 @@ def convert_split(split_name, file_list, ann_dir, img_dir, output_path, class_to
 
 
 def main():
-    base = Path(__file__).parent / "DIOR"
+    base = Path("data/DIOR/DIOR")
     ann_dir = str(base / "Annotations")
     img_dir = str(base / "JPEGImages")
-    output_dir = str(Path(__file__).parent / "annotations")
+    output_dir = str(Path("data/DIOR/annotations"))
 
     class_to_id = {name: i + 1 for i, name in enumerate(DIOR_CLASSES)}  # 1-indexed
 
